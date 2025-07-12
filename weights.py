@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, List
 
-from .layers import AttentionWeights, LayerNormWeights, LinearWeights, MLPWeights
+from layers import AttentionWeights, LayerNormWeights, LinearWeights, MLPWeights
 
 
 @dataclass
