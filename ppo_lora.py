@@ -82,7 +82,7 @@ class PpoLoRATrainerV19:
         self.ref_model.eval()
         lora_params = [p for p in self.active_model.parameters() if p.requires_grad]
         print(f"   Correctly found {sum(p.numel() for p in lora_params):,} trainable parameters.")
-        self.optimizer = optim.Adam(lora_params, lr=1e-3)
+        self.optimizer = optim.Adam(lora_params, lr=1e-5)
 
     def _get_logits(self, model, input_ids):
         model_module = model.module if isinstance(model, nn.DataParallel) else model
@@ -105,15 +105,12 @@ class PpoLoRATrainerV19:
         """
         Computes a reward based on a target range and heavily penalizes not stopping.
         """
-        if 40 <= token_count <= 60 and generated_eos:
-            return 1.0
-        
-        if not generated_eos:
-            return -1.0
-
-        distance = min(abs(token_count - 40), abs(token_count - 60))
-        penalty = distance / self.max_gen_tokens
-        return 0.5 - penalty
+        if token_count >= 149:
+            return -0.25
+        target = 50
+        scale = 2000
+        distance = token_count - target
+        return 1 / (1 + (distance ** 2) / scale)
 
     def generate_and_train(self, prompt_text, eos_bias=0.0):
         bos_id = self.config.tokenizer.bos_id
@@ -234,7 +231,7 @@ def main():
     print("🚀 Starting PPO-style LoRA RL Training for Moondream (V19 - Corrected Learning)")
     
     max_gen_tokens = 150
-    batch_size = 3
+    batch_size = 4
     accumulation_steps = 1
     eos_bias = 2.0 
     
@@ -280,7 +277,7 @@ def main():
             "In the future", "Science shows us", "Education means", "Success comes from", "Friendship is", "The best way to"
         ]
         
-        num_episodes = 200
+        num_episodes = 500
         total_batch_size = batch_size * accumulation_steps
         print(f"\n🏃 Training for {num_episodes} episodes with total batch size {total_batch_size}...")
         wandb.config.update({"num_episodes": num_episodes, "max_gen_tokens": max_gen_tokens, "batch_size": batch_size, "accumulation_steps": accumulation_steps, "eos_bias": eos_bias, "kl_weight": 0.05, "lr": 1e-5})
