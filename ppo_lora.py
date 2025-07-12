@@ -30,7 +30,7 @@ import copy
 import os
 
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1,0"
 
 class CleanLoRALayer(nn.Module):
     """Clean LoRA implementation."""
