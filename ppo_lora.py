@@ -22,7 +22,7 @@ from config import MoondreamConfig
 from text import text_encoder, lm_head, text_decoder
 from huggingface_hub import hf_hub_download
 # This import assumes you have a 'simple_weights.py' file with this function.
-from simple_weights import simple_load_weights 
+from simple_weights import simple_load_weights
 import random
 import wandb
 import time
@@ -31,7 +31,6 @@ import os
 
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = "1,0"
-
 class CleanLoRALayer(nn.Module):
     """Clean LoRA implementation."""
     
@@ -66,70 +65,67 @@ class PpoLoRATrainerV19:
     
     def __init__(self, moondream_model, scaler, target_tokens=50, kl_weight=0.1, max_gen_tokens=70):
         self.active_model = moondream_model
-        
-        # FIX: Correctly access the underlying model module when DataParallel is used
         model_module = self.active_model.module if isinstance(self.active_model, nn.DataParallel) else self.active_model
         self.tokenizer = model_module.tokenizer
         self.config = model_module.config
-        
         self.scaler = scaler
-        
         self.target_tokens = target_tokens
         self.kl_weight = kl_weight
         self.max_gen_tokens = max_gen_tokens
         self.device = next(self.active_model.parameters()).device
         self.eos_id = self.config.tokenizer.eos_id
         self.max_context = self.config.text.max_context
-        
         print("   Creating frozen reference model (on primary device)...")
         self.ref_model = copy.deepcopy(model_module).to(self.device)
         for param in self.ref_model.parameters():
             param.requires_grad = False
         self.ref_model.eval()
-        
         lora_params = [p for p in self.active_model.parameters() if p.requires_grad]
         print(f"   Correctly found {sum(p.numel() for p in lora_params):,} trainable parameters.")
-        self.optimizer = optim.Adam(lora_params, lr=1e-4)
+        self.optimizer = optim.Adam(lora_params, lr=1e-3)
 
     def _get_logits(self, model, input_ids):
         model_module = model.module if isinstance(model, nn.DataParallel) else model
         model_module._setup_caches()
         text_model = model_module.text
-
         inputs_embeds = text_encoder(input_ids, text_model)
         seq_len = inputs_embeds.shape[1]
-        
         pos_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
-        
         full_causal_mask = torch.tril(
             torch.ones(1, 1, self.max_context, self.max_context, device=input_ids.device, dtype=torch.bool)
         )
         attn_mask = full_causal_mask[:, :, :seq_len, :self.max_context]
-        
         hidden_states = text_decoder(
             inputs_embeds, text_model, attn_mask, pos_ids, self.config.text, lora=None
         )
-        
         logits = lm_head(hidden_states, text_model)
         return logits
 
-    def compute_reward(self, token_count):
-        distance = abs(token_count - self.target_tokens)
-        reward = 1.0 - (distance / self.max_gen_tokens)
-        return reward
-    
+    def compute_reward(self, token_count, generated_eos):
+        """
+        Computes a reward based on a target range and heavily penalizes not stopping.
+        """
+        if 40 <= token_count <= 60 and generated_eos:
+            return 1.0
+        
+        if not generated_eos:
+            return -1.0
+
+        distance = min(abs(token_count - 40), abs(token_count - 60))
+        penalty = distance / self.max_gen_tokens
+        return 0.5 - penalty
+
     def generate_and_train(self, prompt_text, eos_bias=0.0):
         bos_id = self.config.tokenizer.bos_id
         prompt_tokens = [bos_id] + self.tokenizer.encode(prompt_text).ids
         input_ids = torch.tensor([prompt_tokens], device=self.device)
 
         generated_tokens, active_log_probs, kl_divs = [], [], []
+        generated_eos = False
 
-        # FINAL FIX: Programmatically get the model's dtype and use it for autocast
-        # This ensures the training loop's dtype always matches the model's dtype.
         model_dtype = next(self.active_model.parameters()).dtype
         with torch.amp.autocast(device_type='cuda', dtype=model_dtype):
-            for _ in range(self.max_gen_tokens):
+            for i in range(self.max_gen_tokens):
                 active_logits = self._get_logits(self.active_model, input_ids)
                 with torch.no_grad():
                     ref_logits = self._get_logits(self.ref_model, input_ids)
@@ -140,20 +136,22 @@ class PpoLoRATrainerV19:
                 else:
                     active_logits_last = active_logits[-1, :]
                     ref_logits_last = ref_logits[-1, :]
-
-                # Cast to float32 for softmax and other calculations to maintain precision
+                
                 active_logits_last = active_logits_last.float()
                 ref_logits_last = ref_logits_last.float()
                 
                 active_logits_last[..., self.eos_id] += eos_bias
 
                 probs = F.softmax(active_logits_last, dim=-1)
+                
+                # Ensure probs is 2D for multinomial sampling
                 if probs.dim() == 1:
                     probs = probs.unsqueeze(0)
-                
+
                 next_token = torch.multinomial(probs, num_samples=1)
                 
                 if next_token.item() == self.eos_id:
+                    generated_eos = True
                     break
                 
                 active_log_softmax = F.log_softmax(active_logits_last, dim=-1)
@@ -167,20 +165,24 @@ class PpoLoRATrainerV19:
                 kl_divs.append(kl_div)
 
                 generated_tokens.append(next_token.item())
+                
+                # --- FIX: Unsqueeze next_token to make it 2D before concatenation ---
                 input_ids = torch.cat([input_ids, next_token], dim=1)
                 
                 del active_logits, ref_logits
 
-        if not generated_tokens:
-            return 0, 0, 0, ""
+        # If generation stops immediately, we have no loss to compute
+        if not active_log_probs:
+            return 0, 0, len(generated_tokens), ""
 
         token_count = len(generated_tokens)
-        reward = self.compute_reward(token_count)
+        reward = self.compute_reward(token_count, generated_eos)
         
         policy_loss = -reward * torch.stack(active_log_probs).mean()
         kl_penalty = torch.stack(kl_divs).mean()
         loss = policy_loss + self.kl_weight * kl_penalty
         
+        # Backward pass should only happen if a loss is computed
         self.scaler.scale(loss).backward()
         
         generated_text = self.tokenizer.decode(generated_tokens)
@@ -193,7 +195,9 @@ class PpoLoRATrainerV19:
 
         for i, prompt in enumerate(prompts):
             loss, reward, token_count, generated = self.generate_and_train(prompt, eos_bias)
-            if loss == 0 and reward == 0: # Skip updates if nothing was generated
+            
+            # Skip optimizer step if no loss was computed (e.g., immediate EOS)
+            if loss == 0 and reward == 0:
                 continue
                 
             loss_val = loss / accumulation_steps
@@ -223,7 +227,6 @@ def add_lora_layers(model):
         if i >= len(model.text.blocks) - 3:
             block.attn.proj = CleanLoRALayer(block.attn.proj, rank=8, alpha=16)
             block.mlp.fc2 = CleanLoRALayer(block.mlp.fc2, rank=8, alpha=16)
-
     model.text.lm_head = CleanLoRALayer(model.text.lm_head, rank=8, alpha=16)
     return model
 
@@ -231,9 +234,9 @@ def main():
     print("🚀 Starting PPO-style LoRA RL Training for Moondream (V19 - Corrected Learning)")
     
     max_gen_tokens = 150
-    batch_size = 1
+    batch_size = 3
     accumulation_steps = 1
-    eos_bias = 0.5 # A small positive value to encourage EOS
+    eos_bias = 2.0 
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Primary Device: {device}")
@@ -248,14 +251,9 @@ def main():
     try:
         print("\n📦 Loading Moondream...")
         config = MoondreamConfig()
-        
-        # FIX: Intelligently select model dtype based on hardware support
         model_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
         moondream_model = MoondreamModel(config, dtype=model_dtype)
-        
         weights_path = hf_hub_download(repo_id="vikhyatk/moondream2", filename="model.safetensors")
-        
-        # FIX: Use a dedicated weight loading function to prevent silent failures
         print("   Loading weights into model using simple_load_weights...")
         simple_load_weights(weights_path, moondream_model)
         print("   Model weights loaded successfully!")
@@ -275,7 +273,7 @@ def main():
         scaler = torch.amp.GradScaler()
         
         print("   Setting up PPO LoRA trainer...")
-        rl_trainer = PpoLoRATrainerV19(moondream_model, scaler, target_tokens=50, kl_weight=0.1, max_gen_tokens=max_gen_tokens)
+        rl_trainer = PpoLoRATrainerV19(moondream_model, scaler, target_tokens=50, kl_weight=0.05, max_gen_tokens=max_gen_tokens)
         
         train_prompts = [
             "The weather today is", "I believe that", "Technology helps us", "Learning is important because", 
@@ -285,7 +283,7 @@ def main():
         num_episodes = 200
         total_batch_size = batch_size * accumulation_steps
         print(f"\n🏃 Training for {num_episodes} episodes with total batch size {total_batch_size}...")
-        wandb.config.update({"num_episodes": num_episodes, "max_gen_tokens": max_gen_tokens, "batch_size": batch_size, "accumulation_steps": accumulation_steps, "eos_bias": eos_bias})
+        wandb.config.update({"num_episodes": num_episodes, "max_gen_tokens": max_gen_tokens, "batch_size": batch_size, "accumulation_steps": accumulation_steps, "eos_bias": eos_bias, "kl_weight": 0.05, "lr": 1e-5})
         
         for episode in range(num_episodes):
             batch_prompts = random.sample(train_prompts, total_batch_size)
