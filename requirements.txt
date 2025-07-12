@@ -2,3 +2,12 @@ einops
 pyvips-binary==8.16.0
 pyvips==2.2.3
 huggingface_hub
+trl
+datasets
+transformers
+torch
+accelerate
+tokenizers
+numpy
+tqdm
+wandb

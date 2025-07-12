@@ -191,6 +191,44 @@ class MoondreamModel(nn.Module):
         logits = lm_head(hidden, self.text)
         return logits, hidden
 
+    def forward_train(
+        self,
+        image: Image.Image,
+        prompt_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+    ):
+        img_emb = self._run_vision_encoder(image)
+
+        bos_emb = text_encoder(
+            torch.tensor(self.tokenizer.bos_token_id(), device=self.device).view(1, -1),
+            self.text,
+        )
+
+        prompt_emb = text_encoder(prompt_tokens, self.text)
+        target_emb = text_encoder(target_tokens, self.text)
+
+        input_emb = torch.cat(
+            [bos_emb, img_emb, prompt_emb, target_emb],
+            dim=1,
+        )
+
+        seq_len = input_emb.shape[1]
+        pos_ids = torch.arange(0, seq_len, device=self.device).view(1, -1)
+
+        attn_mask = torch.tril(
+            torch.ones(1, 1, seq_len, seq_len, device=self.device, dtype=torch.bool)
+        )
+        img_seq_len = img_emb.shape[1]
+        attn_mask[..., :img_seq_len, :img_seq_len] = 1
+
+        hidden = text_decoder(
+            input_emb, self.text, attn_mask, pos_ids, self.config.text, None
+        )
+        logits = lm_head(hidden, self.text)
+
+        # Return only the logits for the target tokens
+        return logits[:, -target_tokens.shape[1] :, :]
+
     def compile(self):
         for module in self.modules():
             if isinstance(module, QuantizedLinear):
