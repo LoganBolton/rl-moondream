@@ -1,3 +1,5 @@
+*.safetensors
+
 # Virtual environments
 moon/
 venv/
