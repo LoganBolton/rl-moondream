@@ -1,4 +1,26 @@
 *.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.model
+*.onnx
+*.h5
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.tflite
+*.pb
+*.mlmodel
+*.msgpack
+*.arrow
+*.parquet
+*.gguf
+model.safetensors.part*
+moondream2-mmproj-f16.gguf
+moondream2-text-model-f16.gguf
 
 # Virtual environments
 moon/
